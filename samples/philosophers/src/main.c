@@ -46,10 +46,10 @@
 #include <zephyr/sys/__assert.h>
 
 #define SEMAPHORES 1
-#define MUTEXES 2
-#define STACKS 3
-#define FIFOS 4
-#define LIFOS 5
+#define MUTEXES    2
+#define STACKS     3
+#define FIFOS      4
+#define LIFOS      5
 
 /**************************************/
 /* control the behaviour of the demo **/
@@ -103,10 +103,7 @@ static void print_phil_state(int id, const char *fmt, int32_t delay)
 
 	set_phil_state_pos(id);
 
-	printk("Philosopher %d [%s:%s%d] ",
-	       id, prio < 0 ? "C" : "P",
-	       prio < 0 ? "" : " ",
-	       prio);
+	printk("Philosopher %d [%s:%s%d] ", id, prio < 0 ? "C" : "P", prio < 0 ? "" : " ", prio);
 
 	if (delay) {
 		printk(fmt, delay < 1000 ? " " : "", delay);
@@ -124,7 +121,7 @@ static int32_t get_random_delay(int id, int period_in_ms)
 	 * and the current uptime to create some pseudo-randomness. It produces
 	 * a value between 0 and 31.
 	 */
-	int32_t delay = (k_uptime_get_32()/100 * (id + 1)) & 0x1f;
+	int32_t delay = (k_uptime_get_32() / 100 * (id + 1)) & 0x1f;
 
 	/* add 1 to not generate a delay of 0 */
 	int32_t ms = (delay + 1) * period_in_ms;
@@ -176,7 +173,6 @@ void philosopher(void *id, void *unused1, void *unused2)
 		print_phil_state(my_id, " THINKING [ %s%d ms ] ", delay);
 		k_msleep(delay);
 	}
-
 }
 
 static int new_prio(int phil)
@@ -185,7 +181,7 @@ static int new_prio(int phil)
 #if SAME_PRIO
 	return 0;
 #else
-	return -(phil - (NUM_PHIL/2));
+	return -(phil - (NUM_PHIL / 2));
 #endif
 #else
 #if defined(CONFIG_COOP_ENABLED)
@@ -193,7 +189,7 @@ static int new_prio(int phil)
 #elif defined(CONFIG_PREEMPT_ENABLED)
 	return phil;
 #else
-	#error unpossible
+#error unpossible
 #endif
 #endif
 }
@@ -216,9 +212,8 @@ static void start_threads(void)
 	for (int i = 0; i < NUM_PHIL; i++) {
 		int prio = new_prio(i);
 
-		k_thread_create(&threads[i], &stacks[i][0], STACK_SIZE,
-				philosopher, INT_TO_POINTER(i), NULL, NULL,
-				prio, K_USER, K_FOREVER);
+		k_thread_create(&threads[i], &stacks[i][0], STACK_SIZE, philosopher,
+				INT_TO_POINTER(i), NULL, NULL, prio, K_USER, K_FOREVER);
 #ifdef CONFIG_THREAD_NAME
 		char tname[CONFIG_THREAD_MAX_NAME_LEN];
 
@@ -232,15 +227,16 @@ static void start_threads(void)
 	}
 }
 
-#define DEMO_DESCRIPTION  \
-	"\x1b[2J\x1b[15;1H"   \
-	"Demo Description\n"  \
-	"----------------\n"  \
-	"An implementation of a solution to the Dining Philosophers\n" \
-	"problem (a classic multi-thread synchronization problem).\n" \
-	"This particular implementation demonstrates the usage of multiple\n" \
-	"preemptible and cooperative threads of differing priorities, as\n" \
-	"well as %s %s and thread sleeping.\n", obj_init_type, fork_type_str
+#define DEMO_DESCRIPTION                                                                           \
+	"\x1b[2J\x1b[15;1H"                                                                        \
+	"Demo Description [supervisor]\n"                                                          \
+	"----------------\n"                                                                       \
+	"An implementation of a solution to the Dining Philosophers\n"                             \
+	"problem (a classic multi-thread synchronization problem).\n"                              \
+	"This particular implementation demonstrates the usage of multiple\n"                      \
+	"preemptible and cooperative threads of differing priorities, as\n"                        \
+	"well as %s %s and thread sleeping.\n",                                                    \
+		obj_init_type, fork_type_str
 
 static void display_demo_description(void)
 {
