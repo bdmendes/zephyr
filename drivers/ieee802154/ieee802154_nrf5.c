@@ -291,7 +291,7 @@ static int nrf5_energy_scan_start(const struct device *dev,
 
 		if (nrf_802154_energy_detection(duration * 1000) == false) {
 			nrf5_data.energy_scan_done = NULL;
-			err = -EPERM;
+			err = -EBUSY;
 		}
 	} else {
 		err = -EALREADY;
@@ -484,73 +484,6 @@ static bool nrf5_tx_csma_ca(struct net_pkt *pkt, uint8_t *payload)
 #endif
 
 #if defined(CONFIG_NET_PKT_TXTIME)
-/**
- * @brief Convert 32-bit target time to absolute 64-bit target time.
- */
-static uint64_t target_time_convert_to_64_bits(uint32_t target_time)
-{
-	/**
-	 * Target time is provided as two 32-bit integers defining a moment in time
-	 * in microsecond domain. In order to use bit-shifting instead of modulo
-	 * division, calculations are performed in microsecond domain, not in RTC ticks.
-	 *
-	 * The target time can point to a moment in the future, but can be overdue
-	 * as well. In order to determine what's the case and correctly set the
-	 * absolute target time, it's necessary to compare the least significant
-	 * 32 bits of the current time, 64-bit time with the provided 32-bit target
-	 * time. Let's assume that half of the 32-bit range can be used for specifying
-	 * target times in the future, and the other half - in the past.
-	 */
-	uint64_t now_us = nrf_802154_time_get();
-	uint32_t now_us_wrapped = (uint32_t)now_us;
-	uint32_t time_diff = target_time - now_us_wrapped;
-	uint64_t result = UINT64_C(0);
-
-	if (time_diff < 0x80000000) {
-		/**
-		 * Target time is assumed to be in the future. Check if a 32-bit overflow
-		 * occurs between the current time and the target time.
-		 */
-		if (now_us_wrapped > target_time) {
-			/**
-			 * Add a 32-bit overflow and replace the least significant 32 bits
-			 * with the provided target time.
-			 */
-			result = now_us + UINT32_MAX + 1;
-			result &= ~(uint64_t)UINT32_MAX;
-			result |= target_time;
-		} else {
-			/**
-			 * Leave the most significant 32 bits and replace the least significant
-			 * 32 bits with the provided target time.
-			 */
-			result = (now_us & (~(uint64_t)UINT32_MAX)) | target_time;
-		}
-	} else {
-		/**
-		 * Target time is assumed to be in the past. Check if a 32-bit overflow
-		 * occurs between the target time and the current time.
-		 */
-		if (now_us_wrapped > target_time) {
-			/**
-			 * Leave the most significant 32 bits and replace the least significant
-			 * 32 bits with the provided target time.
-			 */
-			result = (now_us & (~(uint64_t)UINT32_MAX)) | target_time;
-		} else {
-			/**
-			 * Subtract a 32-bit overflow and replace the least significant
-			 * 32 bits with the provided target time.
-			 */
-			result = now_us - UINT32_MAX - 1;
-			result &= ~(uint64_t)UINT32_MAX;
-			result |= target_time;
-		}
-	}
-
-	return result;
-}
-
 static bool nrf5_tx_at(struct nrf5_802154_data *nrf5_radio, struct net_pkt *pkt,
 		   uint8_t *payload, enum ieee802154_tx_mode mode)
 {
@@ -568,7 +501,7 @@ static bool nrf5_tx_at(struct nrf5_802154_data *nrf5_radio, struct net_pkt *pkt,
 #if defined(CONFIG_IEEE802154_NRF5_MULTIPLE_CCA)
 	case IEEE802154_OPENTHREAD_TX_MODE_TXTIME_MULTIPLE_CCA:
 		cca = true;
-		max_extra_cca_attempts = nrf5_radio->max_extra_cca_attempts;
+		max_extra_cca_attempts = nrf5_data.max_extra_cca_attempts;
 		break;
 #endif
 		break;
@@ -594,7 +527,12 @@ static bool nrf5_tx_at(struct nrf5_802154_data *nrf5_radio, struct net_pkt *pkt,
 		.extra_cca_attempts = max_extra_cca_attempts,
 #endif
 	};
-	uint64_t tx_at = target_time_convert_to_64_bits(net_pkt_txtime(pkt) / NSEC_PER_USEC);
+
+	/* The timestamp points to the start of PHR but `nrf_802154_transmit_raw_at`
+	 * expects a timestamp pointing to start of SHR.
+	 */
+	uint64_t tx_at = nrf_802154_timestamp_phr_to_shr_convert(
+		net_ptp_time_to_ns(net_pkt_timestamp(pkt)) / NSEC_PER_USEC);
 
 	return nrf_802154_transmit_raw_at(payload, tx_at, &metadata);
 }
@@ -703,11 +641,11 @@ static int nrf5_tx(const struct device *dev,
 	}
 }
 
-static uint64_t nrf5_get_time(const struct device *dev)
+static net_time_t nrf5_get_time(const struct device *dev)
 {
 	ARG_UNUSED(dev);
 
-	return nrf_802154_time_get();
+	return (net_time_t)nrf_802154_time_get() * NSEC_PER_USEC;
 }
 
 static uint8_t nrf5_get_acc(const struct device *dev)
@@ -980,13 +918,7 @@ static int nrf5_configure(const struct device *dev,
 
 #if defined(CONFIG_IEEE802154_CSL_ENDPOINT)
 	case IEEE802154_CONFIG_CSL_RX_TIME: {
-		/*
-		 * `target_time_convert_to_64_bits()` is a workaround until OpenThread (the only
-		 * CSL user in Zephyr so far) is able to schedule RX windows using 64-bit time.
-		 */
-		uint64_t csl_rx_time = target_time_convert_to_64_bits(config->csl_rx_time);
-
-		nrf_802154_csl_writer_anchor_time_set(csl_rx_time);
+		nrf_802154_csl_writer_anchor_time_set(config->csl_rx_time / NSEC_PER_USEC);
 	} break;
 
 	case IEEE802154_CONFIG_RX_SLOT: {
@@ -996,15 +928,10 @@ static int nrf5_configure(const struct device *dev,
 		 * calculated as if the following reception windows were at times
 		 * anchor_time + n * csl_period. The previously set
 		 * anchor_time will be used for calculations.
-		 *
-		 * `target_time_convert_to_64_bits()` is a workaround until OpenThread
-		 * (the only CSL user in Zephyr so far) is able to schedule RX windows
-		 * using 64-bit time.
 		 */
-		uint64_t start = target_time_convert_to_64_bits(config->rx_slot.start);
-
-		nrf_802154_receive_at(start, config->rx_slot.duration, config->rx_slot.channel,
-				      DRX_SLOT_RX);
+		nrf_802154_receive_at(config->rx_slot.start / NSEC_PER_USEC,
+				      config->rx_slot.duration / NSEC_PER_USEC,
+				      config->rx_slot.channel, DRX_SLOT_RX);
 	} break;
 
 	case IEEE802154_CONFIG_CSL_PERIOD:
@@ -1012,13 +939,13 @@ static int nrf5_configure(const struct device *dev,
 		break;
 #endif /* CONFIG_IEEE802154_CSL_ENDPOINT */
 
-#if defined(IEEE802154_NRF5_MULTIPLE_CCA)
-	case IEEE802154_OPENTHREAD_CONFIG_MULTIPLE_CCA:
+#if defined(CONFIG_IEEE802154_NRF5_MULTIPLE_CCA)
+	case IEEE802154_OPENTHREAD_CONFIG_MAX_EXTRA_CCA_ATTEMPTS:
 		nrf5_data.max_extra_cca_attempts =
 			((const struct ieee802154_openthread_config *)config)
 				->max_extra_cca_attempts;
 		break;
-#endif /* IEEE802154_NRF5_MULTIPLE_CCA */
+#endif /* CONFIG_IEEE802154_NRF5_MULTIPLE_CCA */
 
 	default:
 		return -EINVAL;
@@ -1034,8 +961,8 @@ static int nrf5_attr_get(const struct device *dev,
 	ARG_UNUSED(dev);
 	ARG_UNUSED(value);
 
-	switch (attr) {
-#if defined(IEEE802154_NRF5_MULTIPLE_CCA)
+	switch ((uint32_t)attr) {
+#if defined(CONFIG_IEEE802154_NRF5_MULTIPLE_CCA)
 	/* TODO: t_recca and t_ccatx should be provided by the public API of the
 	 * nRF 802.15.4 Radio Driver.
 	 */
@@ -1067,7 +994,8 @@ void nrf_802154_received_timestamp_raw(uint8_t *data, int8_t power, uint8_t lqi,
 		nrf5_data.rx_frames[i].lqi = lqi;
 
 #if defined(CONFIG_NET_PKT_TIMESTAMP)
-		nrf5_data.rx_frames[i].time = nrf_802154_mhr_timestamp_get(time, data[0]);
+		nrf5_data.rx_frames[i].time =
+			nrf_802154_timestamp_end_to_phr_convert(time, data[0]);
 #endif
 
 		if (data[ACK_REQUEST_BYTE] & ACK_REQUEST_BIT) {
@@ -1162,9 +1090,8 @@ void nrf_802154_transmitted_raw(uint8_t *frame,
 		nrf5_data.ack_frame.lqi = metadata->data.transmitted.lqi;
 
 #if defined(CONFIG_NET_PKT_TIMESTAMP)
-		nrf5_data.ack_frame.time =
-			nrf_802154_mhr_timestamp_get(
-				metadata->data.transmitted.time, nrf5_data.ack_frame.psdu[0]);
+		nrf5_data.ack_frame.time = nrf_802154_timestamp_end_to_phr_convert(
+			metadata->data.transmitted.time, nrf5_data.ack_frame.psdu[0]);
 #endif
 	}
 
